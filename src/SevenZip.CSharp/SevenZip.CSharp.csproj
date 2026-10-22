@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>SevenZip.CSharp</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <Authors>Marz</Authors>
+    <Copyright>Copyright 2026 Marz</Copyright>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+  </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="SevenZip.CSharp.Tests" />
+    <InternalsVisibleTo Include="ArchiveEngine.IntegrationTests" />
+  </ItemGroup>
+</Project>

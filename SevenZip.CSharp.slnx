@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="src/SevenZip.CSharp/SevenZip.CSharp.csproj" />
+  <Project Path="tests/SevenZip.CSharp.Tests/SevenZip.CSharp.Tests.csproj" />
+  <Project Path="samples/BasicUsage/BasicUsage.csproj" />
+</Solution>

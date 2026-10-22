@@ -1,0 +1,9 @@
+7z-bridge-csharp
+Copyright 2026 Marz
+
+The project's managed code, tests, examples and documentation are licensed
+under the Apache License, Version 2.0. See LICENSE.txt and LICENSE-SCOPE.md.
+
+No native DLL, SFX module or executable is included in this repository.
+Caller-supplied native components retain their own licenses and are not
+relicensed by this project's Apache license. See THIRD-PARTY-NOTICES.md.
