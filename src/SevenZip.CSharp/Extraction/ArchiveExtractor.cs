@@ -7,6 +7,32 @@ namespace SevenZip.CSharp;
 [System.Runtime.Versioning.SupportedOSPlatform("windows")]
 public static class ArchiveExtractor
 {
+    public static Task<ArchiveEngineOutcome> ExtractItemsAsync(string libraryPath, string path,
+        ArchiveEntrySelection selection, string destination, ArchiveOperationContext? context = null,
+        bool overwrite = false, IProgress<EngineExtractionProgress>? progress = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(destination);
+        context ??= new();
+        return RunItemsWithPasswordsAsync(libraryPath, path, selection, destination, null,
+            context.Password, context.Password, context.CancellationToken, overwrite, context: context,
+            extractionProgress: progress);
+    }
+
+    public static Task<ArchiveEngineOutcome> RunItemsWithPasswordsAsync(string libraryPath, string path,
+        ArchiveEntrySelection selection, string? destination, ExtractionMeasurement? measured,
+        ArchivePassword? headerPassword, ArchivePassword? dataPassword, CancellationToken token,
+        bool overwrite = false, IProgress<EngineProgress>? operationProgress = null,
+        IArchiveExtractionOutputPlan? outputTransaction = null, ArchiveOperationContext? context = null,
+        string temporaryFilePrefix = ".archive-extract-", IProgress<EngineExtractionProgress>? extractionProgress = null)
+    {
+        ArgumentNullException.ThrowIfNull(selection);
+        var operation = new ArchiveOperationContext(headerPassword, context?.Control, token, context?.AllowedFormats);
+        return Task.Run(() => Run(libraryPath, path, destination, measured, headerPassword, dataPassword, token,
+            overwrite: overwrite, operationProgress: operationProgress, outputTransaction: outputTransaction,
+            context: operation, temporaryFilePrefix: temporaryFilePrefix, extractionProgress: extractionProgress,
+            itemSelection: selection));
+    }
+
     /// <summary>Extract all entries to a disk destination using safe per-file publication.</summary>
     public static Task<ArchiveEngineOutcome> ExtractAsync(string libraryPath, string path, string destination,
         ArchiveOperationContext? context = null, bool overwrite = false, IProgress<EngineProgress>? progress = null,
@@ -14,20 +40,26 @@ public static class ArchiveExtractor
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(destination);
         context ??= new();
-        return RunWithPasswordsAsync(libraryPath, path, destination, null, context.Password, context.Password,
+        return RunAllWithPasswordsAsync(libraryPath, path, destination, null, context.Password, context.Password,
             context.CancellationToken, overwrite, progress, context: context, extractionProgress: extractionProgress);
     }
+
+    public static Task<ArchiveEngineOutcome> TestWithPasswordsAsync(string libraryPath, string path,
+        ArchivePassword? headerPassword, ArchivePassword? dataPassword, CancellationToken token,
+        IProgress<EngineProgress>? progress = null, ArchiveOperationContext? context = null)
+        => RunAllWithPasswordsAsync(libraryPath, path, null, null, headerPassword, dataPassword, token,
+            operationProgress: progress, context: context);
 
     public static Task<ArchiveEngineOutcome> TestAsync(string libraryPath, string path,
         ArchiveOperationContext? context = null, IProgress<EngineProgress>? progress = null)
     {
         context ??= new();
-        return RunWithPasswordsAsync(libraryPath, path, null, null, context.Password, context.Password,
+        return RunAllWithPasswordsAsync(libraryPath, path, null, null, context.Password, context.Password,
             context.CancellationToken, operationProgress: progress, context: context);
     }
 
     /// <summary>A null data password deliberately does not reuse the header password. Borrow both handles.</summary>
-    public static Task<ArchiveEngineOutcome> RunWithPasswordsAsync(string libraryPath, string path, string? destination,
+    internal static Task<ArchiveEngineOutcome> RunAllWithPasswordsAsync(string libraryPath, string path, string? destination,
         ExtractionMeasurement? measured, ArchivePassword? headerPassword, ArchivePassword? dataPassword,
         CancellationToken token, bool overwrite = false, IProgress<EngineProgress>? operationProgress = null,
         IArchiveExtractionOutputPlan? outputTransaction = null, ArchiveOperationContext? context = null,
@@ -40,7 +72,7 @@ public static class ArchiveExtractor
     }
 
     internal static Task<ArchiveEngineOutcome> RunToStreamsWithPasswordsAsync(string libraryPath, string path,
-        IReadOnlyCollection<ArchivePath> requested, Func<ArchiveEntryInfo, SequentialOutput> sink,
+        ArchiveEntrySelection requested, Func<ArchiveEntryInfo, SequentialOutput> sink,
         Action<ArchiveEntryInfo> completed, ArchivePassword? headerPassword, ArchivePassword? dataPassword, CancellationToken token,
         IProgress<EngineProgress>? operationProgress = null, ArchiveOperationContext? context = null)
     {
@@ -48,17 +80,16 @@ public static class ArchiveExtractor
         ArgumentNullException.ThrowIfNull(sink);
         ArgumentNullException.ThrowIfNull(completed);
         var operation = new ArchiveOperationContext(headerPassword, context?.Control, token, context?.AllowedFormats);
-        return Task.Run(() => Run(libraryPath, path, null, null, headerPassword, dataPassword, token, requested, sink, completed,
-            operationProgress: operationProgress, context: operation));
+        return Task.Run(() => Run(libraryPath, path, null, null, headerPassword, dataPassword, token, sink: sink, completed: completed,
+            operationProgress: operationProgress, context: operation, itemSelection: requested));
     }
 
     private static ArchiveEngineOutcome Run(string libraryPath, string path, string? destination,
         ExtractionMeasurement? measured, ArchivePassword? password, ArchivePassword? dataPassword, CancellationToken token,
-        IReadOnlyCollection<ArchivePath>? requested = null,
         Func<ArchiveEntryInfo, SequentialOutput>? sink = null, Action<ArchiveEntryInfo>? completed = null, bool overwrite = false,
         IProgress<EngineProgress>? operationProgress = null, IArchiveExtractionOutputPlan? outputTransaction = null,
         ArchiveOperationContext? context = null, string temporaryFilePrefix = ".archive-extract-",
-        IProgress<EngineExtractionProgress>? extractionProgress = null)
+        IProgress<EngineExtractionProgress>? extractionProgress = null, ArchiveEntrySelection? itemSelection = null)
     {
         context ??= new(password, cancellationToken: token);
         using var nativeControl = context.Control?.EnterNativeOperation();
@@ -74,20 +105,27 @@ public static class ArchiveExtractor
                 try { snapshot = ArchiveInspector.Map(session, path, token); }
                 catch (InvalidDataException) { return new(true, new(ArchiveFailureCode.UnsupportedOperation, "归档包含当前桥接尚不支持的元数据")); } // No output has been created.
                 if (snapshot is null) return new(false);
+                itemSelection ??= snapshot.SelectAll();
+                if (!snapshot.IsCurrent(itemSelection))
+                    return new(true, new(ArchiveFailureCode.ConflictDetected, "条目选择已失效，请刷新归档后重试"));
+                var requestedItems = itemSelection.Ids.Select(id => snapshot.ById[id]).ToArray();
+                var requestedIds = itemSelection.Ids.ToHashSet();
+                if (itemSelection is not null && measured is not null
+                    && (!measured.Entries.Where(entry => !entry.IsDirectory).Select(entry => entry.Id).ToHashSet()
+                        .SetEquals(requestedItems.Where(entry => !entry.IsDirectory).Select(entry => entry.Id))
+                        || measured.Entries.Any(entry => !snapshot.ById.TryGetValue(entry.Id, out var actual)
+                            || entry.UncompressedSize != actual.UncompressedSize || entry.Crc32 != actual.Crc32)))
+                    return new(true, new(ArchiveFailureCode.ConflictDetected, "解压计划不属于当前归档条目版本"));
                 if (destination is not null && measured is null)
-                    measured = new ExtractionMeasurement(snapshot.Entries, new ActionProgress<EngineExtractionProgress>(value =>
+                    measured = new ExtractionMeasurement(requestedItems, new ActionProgress<EngineExtractionProgress>(value =>
                     {
                         extractionProgress?.Report(value);
                         if (value.OperationProgress is not null) operationProgress?.Report(value.OperationProgress);
                     }));
                 var testing = destination is null && sink is null;
-                var expected = sink is not null ? snapshot.Entries.Where(e => requested!.Any(p => p.IsRoot || p.Equals(e.Path) || p.IsAncestorOf(e.Path))).ToArray()
-                    : testing ? snapshot.Entries : measured!.Entries;
-                if (sink is not null && requested!.Any(p => !p.IsRoot && !snapshot.Entries.Any(e => e.Path.Equals(p))))
-                    return new(true, new(ArchiveFailureCode.EntryNotFound, "未找到请求计算哈希的条目"));
-                var selectedNames = expected.Where(e => !e.IsDirectory).Select(e => e.Path).ToHashSet();
-                var selected = snapshot.PhysicalEntries.Where(p => testing || expected.Any(e => e.Path.Equals(p.Value.Path)))
-                    .ToDictionary(p => p.Key, p => p.Value);
+                var expected = requestedItems;
+                var selected = snapshot.PhysicalEntries.Where(pair => requestedIds.Contains(pair.Value.Id))
+                    .ToDictionary(pair => pair.Key, pair => pair.Value);
                 if (destination is not null || sink is not null)
                 {
                     if (selected.Values.Any(e => (e.Attributes & (ArchiveItemAttributes.SymbolicLink | ArchiveItemAttributes.HardLink
@@ -98,10 +136,9 @@ public static class ArchiveExtractor
                         var unsafeOutput = ExtractionOutputPolicy.Validate(destination, expected, path);
                         if (unsafeOutput is not null) return new(true, unsafeOutput);
                     }
-                    if (!selectedNames.SetEquals(selected.Values.Where(e => !e.IsDirectory).Select(e => e.Path))
-                        || selected.Values.Any(actual => expected.Any(e => e.Path.Equals(actual.Path) && !e.IsDirectory
-                            && (e.UncompressedSize != actual.UncompressedSize || e.Crc32 is { } crc && crc != actual.Crc32))))
-                        return new(true, new(ArchiveFailureCode.InvalidOperation, "当前归档与已验证的解压快照不一致"));
+                    if (!expected.Where(entry => !entry.IsDirectory).Select(entry => entry.Id).ToHashSet()
+                        .SetEquals(selected.Values.Where(entry => !entry.IsDirectory).Select(entry => entry.Id)))
+                        return new(true, new(ArchiveFailureCode.ConflictDetected, "当前归档与已验证的解压快照不一致"));
                     if (outputTransaction is not null)
                     {
                         foreach (var index in selected.Where(p => outputTransaction.OutputEntry(p.Value) is null).Select(p => p.Key).ToArray()) selected.Remove(index);
@@ -109,7 +146,12 @@ public static class ArchiveExtractor
                     }
                     if (destination is not null && !overwrite && outputTransaction is null)
                     {
-                        var skipped = selected.Where(p => !p.Value.IsDirectory && File.Exists(ExtractionOutputPolicy.PathFor(destination, p.Value))).Select(p => p.Key).ToArray();
+                        // Reserve output names in physical order. Later archive items can collide
+                        // even when the destination was initially empty. Exclude skipped bytes.
+                        var reserved = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                        var skipped = selected.Where(pair => !pair.Value.IsDirectory
+                            && (File.Exists(ExtractionOutputPolicy.PathFor(destination, pair.Value))
+                                || !reserved.Add(pair.Value.Path.Value))).Select(pair => pair.Key).ToArray();
                         foreach (var index in skipped) selected.Remove(index);
                     }
                     if (destination is not null && outputTransaction is null)

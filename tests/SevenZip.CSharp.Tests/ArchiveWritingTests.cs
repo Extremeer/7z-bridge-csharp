@@ -29,7 +29,7 @@ public sealed class ArchiveWritingTests : IDisposable
         var created = await ArchiveWriter.CreateAsync(Library, Input(), new() { ArchivePath = archive, Format = format });
         Assert.True(created.IsSuccess, created.Message);
         var added = Path.Combine(root, "added.txt"); File.WriteAllText(added, "new data");
-        var updated = await ArchiveUpdater.UpdateAsync(Library, archive, new()
+        var updated = await NamedEntryFixture.ApplyAsync(Library, archive, new()
         {
             Deleted = [ArchivePath.From("keep.txt")],
             Moves = [new(ArchivePath.From("data.txt"), ArchivePath.From("renamed.txt"))],
@@ -44,10 +44,10 @@ public sealed class ArchiveWritingTests : IDisposable
         Assert.True((await ArchiveExtractor.ExtractAsync(Library, archive, output)).IsSuccess);
         Assert.Equal("original data", File.ReadAllText(Path.Combine(output, "renamed.txt")));
         Assert.Equal("new data", File.ReadAllText(Path.Combine(output, "new.txt")));
-        Assert.True((await ArchiveHasher.ComputeAsync(Library, archive, [ArchivePath.Root], "SHA256")).IsSuccess);
-        Assert.True((await ArchiveUpdater.UpdateAsync(Library, archive, new()
+        Assert.True((await NamedEntryFixture.HashAsync(Library, archive, [ArchivePath.Root], "SHA256")).IsSuccess);
+        Assert.True((await NamedEntryFixture.ApplyAsync(Library, archive, new()
         { RenameSource = ArchivePath.From("renamed.txt"), RenameDestination = ArchivePath.From("renamed-again.txt") })).IsSuccess);
-        Assert.True((await ArchiveUpdater.UpdateAsync(Library, archive, new()
+        Assert.True((await NamedEntryFixture.ApplyAsync(Library, archive, new()
         { Deleted = [ArchivePath.From("renamed-again.txt")] })).IsSuccess);
         Assert.True((await ArchiveExtractor.TestAsync(Library, archive)).IsSuccess);
         Assert.Equal("new.txt", Assert.Single((await ArchiveInspector.InspectAsync(Library, archive))!.Entries, entry => !entry.IsDirectory).Path.Value);
@@ -68,10 +68,10 @@ public sealed class ArchiveWritingTests : IDisposable
             Encryption = new() { Method = ArchiveEncryptionAlgorithm.Aes256, EncryptFileNames = format == ArchiveWriteFormat.SevenZip }
         }, context);
         Assert.True(created.IsSuccess, created.Message);
-        var updated = await ArchiveUpdater.UpdateAsync(Library, archive, new()
+        var updated = await NamedEntryFixture.ApplyAsync(Library, archive, new()
         { RenameSource = ArchivePath.From("data.txt"), RenameDestination = ArchivePath.From("renamed.txt") }, context);
         Assert.True(updated.IsSuccess, updated.Error?.Message);
-        Assert.True((await ArchiveHasher.ComputeAsync(Library, archive, [ArchivePath.Root], "SHA256", context)).IsSuccess);
+        Assert.True((await NamedEntryFixture.HashAsync(Library, archive, [ArchivePath.Root], "SHA256", context)).IsSuccess);
         Assert.False(password.IsDisposed);
         NoOwnedTemporaryOutput();
     }
@@ -116,7 +116,7 @@ public sealed class ArchiveWritingTests : IDisposable
         Assert.True((await ArchiveWriter.CreateAsync(Library, Input(), new() { ArchivePath = archive, Format = format })).IsSuccess);
         var before = File.ReadAllBytes(archive);
         using var stop = new CancellationTokenSource();
-        var result = await ArchiveUpdater.UpdateAsync(Library, archive,
+        var result = await NamedEntryFixture.ApplyAsync(Library, archive,
             new() { Deleted = [ArchivePath.From("data.txt")] }, new(cancellationToken: stop.Token),
             new ActionProgress<EngineProgress>(value => { if (value.OutputBytes > 0) stop.Cancel(); }));
         Assert.Equal(ArchiveFailureCode.OperationCancelled, result.Error!.Code);
@@ -144,7 +144,7 @@ public sealed class ArchiveWritingTests : IDisposable
         using (var data = new MemoryStream("original"u8.ToArray()))
             writer.WriteEntry(new PaxTarEntry(TarEntryType.RegularFile, "data.txt") { DataStream = data });
         var before = File.ReadAllBytes(path);
-        var result = await ArchiveUpdater.UpdateAsync(Library, path, new() { Deleted = [ArchivePath.From("data.txt")] });
+        var result = await NamedEntryFixture.ApplyAsync(Library, path, new() { Deleted = [ArchivePath.From("data.txt")] });
         Assert.Equal(ArchiveFailureCode.UnsupportedOperation, result.Error!.Code);
         Assert.Equal(before, File.ReadAllBytes(path));
         NoOwnedTemporaryOutput();
@@ -159,12 +159,12 @@ public sealed class ArchiveWritingTests : IDisposable
         await File.WriteAllBytesAsync(path, before);
         var request = operation switch
         {
-            "delete" => new ArchiveUpdateRequest { Deleted = [ArchivePath.From("data.txt")] },
-            "rename" => new ArchiveUpdateRequest
+            "delete" => new NamedUpdatePlan { Deleted = [ArchivePath.From("data.txt")] },
+            "rename" => new NamedUpdatePlan
                 { RenameSource = ArchivePath.From("data.txt"), RenameDestination = ArchivePath.From("renamed.txt") },
-            _ => new ArchiveUpdateRequest { Sources = ArchiveSourceEnumerator.EnumerateDirectory(Input()) }
+            _ => new NamedUpdatePlan { Sources = ArchiveSourceEnumerator.EnumerateDirectory(Input()) }
         };
-        var result = await ArchiveUpdater.UpdateAsync(Library, path, request);
+        var result = await NamedEntryFixture.ApplyAsync(Library, path, request);
         Assert.False(result.IsSuccess);
         Assert.Equal(ArchiveFailureCode.ArchiveDamaged, result.Error!.Code);
         Assert.Equal(before, await File.ReadAllBytesAsync(path));

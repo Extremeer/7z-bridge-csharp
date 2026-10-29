@@ -10,7 +10,7 @@ public static class ArchiveUpdater
 {
     private sealed record Item(uint Index, ArchiveEntryInfo Entry, ArchivePath Destination, IReadOnlyDictionary<uint, object?> Properties, string? FilePath = null,
         ArchiveSourceItem? Source = null);
-    public static Task<ArchiveEngineOutcome> UpdateAsync(string libraryPath, string path, ArchiveUpdateRequest request,
+    public static Task<ArchiveEngineOutcome> UpdateItemsAsync(string libraryPath, string path, ArchiveItemUpdateRequest request,
         ArchiveOperationContext? context = null, IProgress<EngineProgress>? progress = null)
     {
         ArgumentNullException.ThrowIfNull(request);
@@ -18,24 +18,15 @@ public static class ArchiveUpdater
         var operation = context;
         var plan = request.Snapshot();
         var relay = new EngineProgressRelay(progress);
-        return Task.Run(() =>
-        {
-            var result = Run(libraryPath, path, plan.Deleted, plan.RenameSource, plan.RenameDestination,
-                operation.CancellationToken, plan.StagingRoot, plan.AddOptions, plan.Sources, plan.Moves,
-                plan.TransactionOutputPath, operation, relay);
-            return result.Applicable ? result : new ArchiveEngineOutcome(true,
-                new(ArchiveFailureCode.UnsupportedOperation, "此格式不支持原生更新"));
-        });
+        return Task.Run(() => Run(libraryPath, path, plan, operation, relay));
     }
 
-    private static ArchiveEngineOutcome Run(string libraryPath, string path, IReadOnlyCollection<ArchivePath> deleted,
-        ArchivePath? source, ArchivePath? destination, CancellationToken token, string? stagingRoot, ArchiveUpdateOptions? addOptions,
-        IReadOnlyList<ArchiveSourceItem>? sources, IReadOnlyList<ArchiveMove>? moves,
-        string? transactionOutput, ArchiveOperationContext context, EngineProgressRelay relay)
+    private static ArchiveEngineOutcome Run(string libraryPath, string path, ArchiveItemUpdateRequest request,
+        ArchiveOperationContext context, EngineProgressRelay relay)
     {
         try
         {
-            var result = RunProtected(libraryPath, path, deleted, source, destination, token, stagingRoot, addOptions, sources, moves, transactionOutput, context, relay);
+            var result = RunProtected(libraryPath, path, request, context, relay);
             return result with { Diagnostic = EngineProgressRelay.CombineDiagnostics(result.Diagnostic, relay.ObserverDiagnostic) };
         }
         catch (OperationCanceledException) { return Fail(ArchiveFailureCode.OperationCancelled, "操作已取消"); }
@@ -44,31 +35,103 @@ public static class ArchiveUpdater
         catch (IOException exception) { return Fail(EngineFailureClassifier.FromIOException(exception), "无法锁定或读取压缩包"); }
     }
 
-    private static ArchiveEngineOutcome RunProtected(string libraryPath, string path, IReadOnlyCollection<ArchivePath> deleted,
-        ArchivePath? source, ArchivePath? destination, CancellationToken token, string? stagingRoot, ArchiveUpdateOptions? addOptions,
-        IReadOnlyList<ArchiveSourceItem>? sources, IReadOnlyList<ArchiveMove>? moves,
-        string? transactionOutput, ArchiveOperationContext context, EngineProgressRelay relay)
+    private static ArchiveEngineOutcome RunProtected(string libraryPath, string path, ArchiveItemUpdateRequest request,
+        ArchiveOperationContext context, EngineProgressRelay relay)
     {
+        var token = context.CancellationToken;
         using var writer = NativeArchiveWriteLock.AcquireAsync(path, token).GetAwaiter().GetResult();
-        var original = transactionOutput is null ? ArchiveFileIdentity.CaptureIfExists(path) : null;
-        var output = new PlanOutput(transactionOutput is not null && !File.Exists(transactionOutput) ? transactionOutput
-            : (transactionOutput ?? path) + ".native-plan-" + Guid.NewGuid().ToString("N"));
+        var original = request.TransactionOutputPath is null ? ArchiveFileIdentity.CaptureIfExists(path) : null;
+        var output = new PlanOutput(request.TransactionOutputPath is not null && !File.Exists(request.TransactionOutputPath)
+            ? request.TransactionOutputPath : (request.TransactionOutputPath ?? path) + ".native-plan-" + Guid.NewGuid().ToString("N"));
         ArchiveEngineOutcome result;
-        try { result = RunCore(libraryPath, path, deleted, source, destination, token, output, stagingRoot, addOptions, transactionOutput, sources, moves, original, context, relay); }
-        catch { Cleanup(output, relay); throw; } // Preserve unexpected primary exceptions, but still clean only owned output.
+        try { result = RunCore(libraryPath, path, request, token, output, original, context, relay); }
+        catch { Cleanup(output, relay); throw; }
         var cleanup = Cleanup(output, relay);
-        if (cleanup is null)
-        {
-            var diagnostic = EngineProgressRelay.CombineDiagnostics(result.Diagnostic, relay.ObserverDiagnostic);
-            return result with { Diagnostic = diagnostic, Error = result.Error is { } error
-                ? error with { Diagnostic = EngineProgressRelay.CombineDiagnostics(error.Diagnostic, relay.ObserverDiagnostic) } : null };
-        }
+        if (cleanup is null) return result;
         return new(true, result.Error is { } primary ? primary with
-        {
-            Message = primary.Message + "; " + cleanup.Message,
-            Diagnostic = string.Join("; ", new[] { primary.Diagnostic, "Cleanup=" + cleanup.Code + "; " + cleanup.Diagnostic, relay.ObserverDiagnostic }.Where(value => value is not null))
-        } : cleanup with { Diagnostic = EngineProgressRelay.CombineDiagnostics(cleanup.Diagnostic, relay.ObserverDiagnostic) }, relay.ObserverDiagnostic);
+        { Message = primary.Message + "; " + cleanup.Message,
+          Diagnostic = EngineProgressRelay.CombineDiagnostics(primary.Diagnostic, "Cleanup=" + cleanup.Code + "; " + cleanup.Diagnostic) } : cleanup,
+          relay.ObserverDiagnostic);
     }
+    private static ArchiveFailure? BuildItemPlan(NativeReadSession session, ArchiveInspector.Snapshot snapshot,
+        ArchiveItemUpdateRequest request, Callback callback, CancellationToken token, EngineProgressRelay relay,
+        out List<Item> items, out HashSet<ArchiveEntryId> deleted, out HashSet<ArchiveEntryId> moved)
+    {
+        items = [];
+        deleted = request.Deleted?.Ids.ToHashSet() ?? [];
+        moved = request.Moves?.Select(move => move.Source).ToHashSet() ?? [];
+        if (request.Deleted is not null && !snapshot.IsCurrent(request.Deleted)
+            || moved.Any(id => id.Revision != snapshot.Revision || !snapshot.ById.ContainsKey(id)))
+            return new(ArchiveFailureCode.ConflictDetected, "条目选择已失效，请刷新归档后重试");
+        if (request.Moves is not null && moved.Count != request.Moves.Count)
+            return new(ArchiveFailureCode.InvalidOperation, "同一归档条目不能同时移动到多个目标");
+        if (deleted.Overlaps(moved)) return new(ArchiveFailureCode.ConflictDetected, "不能同时删除和移动同一归档条目");
+        var destinations = request.Moves?.ToDictionary(move => move.Source, move => move.Destination) ?? [];
+        var finalNames = new Dictionary<string, ArchivePath>(StringComparer.OrdinalIgnoreCase);
+        foreach (var pair in snapshot.PhysicalEntries)
+        {
+            token.ThrowIfCancellationRequested();
+            var entry = pair.Value;
+            if (deleted.Contains(entry.Id)) continue;
+            var renamed = destinations.TryGetValue(entry.Id, out var destination);
+            var next = renamed ? destination! : ArchivePath.From(entry.Path.Value);
+            if (next.IsRoot) return new(ArchiveFailureCode.InvalidOperation, "不能将归档条目重命名为根目录");
+            var invalid = WindowsOutputNamePolicy.ValidateEntry(next, next.Value);
+            if (invalid is not null) return invalid;
+            // Moving both members of an existing duplicate pair preserves that pair.
+            // Two different original names must never newly acquire the same destination.
+            if (finalNames.TryGetValue(next.Value, out var prior)
+                && !string.Equals(prior.Value, entry.Path.Value, StringComparison.OrdinalIgnoreCase))
+                return new(ArchiveFailureCode.ConflictDetected, "目标路径已存在：" + next.Value);
+            finalNames.TryAdd(next.Value, entry.Path);
+            var properties = new Dictionary<uint, object?>();
+            if (renamed) foreach (var id in new uint[] { 3, 6, 7, 9, 10, 11, 12, 15, 19, 21, 28, 53 })
+                properties[id] = id == 3 ? next.Value : session.GetProperty(pair.Key, id);
+            items.Add(new(pair.Key, entry, next, properties));
+        }
+        if (request.Sources is not null || request.StagingRoot is not null)
+        {
+            var sources = request.Sources ?? ArchiveSourceEnumerator.EnumerateDirectory(request.StagingRoot!, token, relay);
+            var explicitReplacementPaths = deleted.Select(id => snapshot.ById[id].Path).ToHashSet();
+            var groups = items.GroupBy(item => item.Destination.Value, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.ToArray(), StringComparer.OrdinalIgnoreCase);
+            if (sources.Any(source => groups.TryGetValue(source.Path.Value, out var matches)
+                && matches.Length > 1 && matches.Any(item => !item.Entry.IsDirectory) && !explicitReplacementPaths.Contains(source.Path)))
+                return new(ArchiveFailureCode.ConflictDetected, "更新名称对应多个归档条目，请先明确要替换的条目");
+            var physical = items.ToDictionary(item => (item.Destination, item.Index));
+            var byName = groups.ToDictionary(group => group.Key, group => group.Value[0], StringComparer.OrdinalIgnoreCase);
+            foreach (var source in sources)
+            {
+                token.ThrowIfCancellationRequested(); source.ValidateSource();
+                var next = source.Path;
+                var invalid = WindowsOutputNamePolicy.ValidateEntry(next, next.Value);
+                if (invalid is not null) return invalid;
+                byName.TryGetValue(next.Value, out var old);
+                if (explicitReplacementPaths.Contains(next)) old = null; // Explicit IDs selected the replaced records; retain same-named siblings.
+                if (old is not null)
+                {
+                    if (source.IsDirectory != old.Entry.IsDirectory)
+                        return new(ArchiveFailureCode.ConflictDetected, "文件与目录路径冲突：" + next.Value);
+                    if (source.IsDirectory || !request.AddOptions!.Overwrite || request.AddOptions.WriteMode == ArchiveUpdateMode.Update
+                        && old.Entry.Modified is { } prior && source.Modified <= prior) continue;
+                }
+                var index = old?.Index ?? uint.MaxValue;
+                var entry = new ArchiveEntryInfo(next, source.IsDirectory, source.Size, 0, source.Modified,
+                    source.IsDirectory ? ArchiveItemAttributes.Directory : ArchiveItemAttributes.None,
+                    !source.IsDirectory && callback.Encrypted, null);
+                var properties = new Dictionary<uint, object?> { [3] = next.Value, [6] = source.IsDirectory,
+                    [7] = (ulong)source.Size, [9] = (uint)source.Attributes, [12] = source.Modified };
+                if (old is not null) physical.Remove((old.Destination, old.Index));
+                var item = new Item(index, entry, next, properties, source.SourcePath, source);
+                physical[(next, index)] = item; byName[next.Value] = item;
+            }
+            items = physical.Values.ToList();
+            callback.AddedFiles = items.Count(item => item.FilePath is not null && !item.Entry.IsDirectory);
+            callback.AddedBytes = items.Where(item => item.FilePath is not null && !item.Entry.IsDirectory).Sum(item => item.Entry.UncompressedSize);
+        }
+        return null;
+    }
+
     private sealed class PlanOutput(string path)
     { internal string Path { get; } = path; internal bool Owned; }
     private static ArchiveFailure? Cleanup(PlanOutput output, EngineProgressRelay relay)
@@ -82,24 +145,15 @@ public static class ArchiveUpdater
                 "任务暂存清理失败，文件保留在：" + output.Path, output.Path, EngineFailureClassifier.Diagnostic(exception), Stage: EngineFailureStage.Cleanup);
         }
     }
-    private static ArchiveEngineOutcome RunCore(string libraryPath, string path, IReadOnlyCollection<ArchivePath> deleted,
-        ArchivePath? source, ArchivePath? destination, CancellationToken token, PlanOutput plan, string? stagingRoot, ArchiveUpdateOptions? addOptions,
-        string? transactionOutput, IReadOnlyList<ArchiveSourceItem>? sources, IReadOnlyList<ArchiveMove>? moves, ArchiveFileIdentity? original, ArchiveOperationContext context, EngineProgressRelay relay)
+    private static ArchiveEngineOutcome RunCore(string libraryPath, string path, ArchiveItemUpdateRequest request,
+        CancellationToken token, PlanOutput plan, ArchiveFileIdentity? original, ArchiveOperationContext context, EngineProgressRelay relay)
     {
+        var transactionOutput = request.TransactionOutputPath;
         var output = plan.Path;
         using var controlScope = context.Control?.EnterNativeOperation();
         try
         {
             token.ThrowIfCancellationRequested();
-            if (deleted.Any(p => p.IsRoot) || source?.IsRoot == true || destination?.IsRoot == true)
-                return Fail(ArchiveFailureCode.InvalidOperation, "不能修改压缩包根目录");
-            if (source is not null && destination is not null && !source.Equals(destination) && source.IsAncestorOf(destination))
-                return Fail(ArchiveFailureCode.InvalidPath, "不能将目录移动到自身内部");
-            if (destination is not null)
-            {
-                var valid = WindowsOutputNamePolicy.ValidateEntry(destination, destination.Value);
-                if (valid is not null) return new(true, valid);
-            }
             var library = SevenZipNativeLibrary.Load(libraryPath);
             foreach (var format in ArchiveFormatSelector.Candidates(path, library, context))
             {
@@ -130,91 +184,26 @@ public static class ArchiveUpdater
                         Encryption = new ArchiveEncryptionSettings { EncryptFileNames = session.HeaderPasswordRequested,
                             Method = snapshot.Format == "7z" ? ArchiveEncryptionAlgorithm.Aes256 : UpdateEncryptionMethod(snapshot.Entries) } });
                 }
-                var existingPaths = snapshot.Entries.Select(e => e.Path).ToHashSet();
-                if (moves is not null && moves.Any(m => m.DestinationPath is null || m.DestinationPath.IsRoot
-                    || !existingPaths.Contains(ArchivePath.From(m.Source.Value))
-                    || ArchivePath.From(m.Source.Value).IsAncestorOf(m.DestinationPath) && !ArchivePath.From(m.Source.Value).Equals(m.DestinationPath)))
-                    return Fail(ArchiveFailureCode.InvalidOperation, "内部移动计划无效");
-                var deletedPaths = deleted.ToHashSet();
-                if (moves is not null && deleted.Any(path => moves.Any(m => path.IsAncestorOf(ArchivePath.From(m.Source.Value)))))
-                    return Fail(ArchiveFailureCode.ConflictDetected, "移动计划不能同时删除要移动的来源");
-                bool IsDeleted(ArchivePath entry)
-                {
-                    for (var current = entry; !current.IsRoot; current = current.Parent)
-                        if (deletedPaths.Contains(current)) return true;
-                    return false;
-                }
-                if (deleted.Any(p => !existingPaths.Contains(p)) || source is not null && !existingPaths.Contains(source))
-                    return Fail(ArchiveFailureCode.EntryNotFound, "未找到请求修改的条目");
-                var items = new List<Item>();
-                var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var pair in snapshot.PhysicalEntries)
-                {
-                    token.ThrowIfCancellationRequested();
-                    var entry = pair.Value;
-                    if (IsDeleted(entry.Path)) continue;
-                    var move = moves?.FirstOrDefault(m => ArchivePath.From(m.Source.Value).IsAncestorOf(entry.Path));
-                    var oldPath = move is null ? source : ArchivePath.From(move.Source.Value);
-                    var newPath = move is null ? destination : move.DestinationPath;
-                    var moved = oldPath is not null && oldPath.IsAncestorOf(entry.Path);
-                    var next = moved ? ArchivePath.From(newPath!.Value + entry.Path.Value[oldPath!.Value.Length..]) : entry.Path;
-                    var validPath = WindowsOutputNamePolicy.ValidateEntry(next, next.Value);
-                    if (validPath is not null) return new(true, validPath);
-                    if (!names.Add(next.Value)) return Fail(ArchiveFailureCode.ConflictDetected, "目标路径已存在：" + next.Value);
-                    var properties = new Dictionary<uint, object?>();
-                    if (moved) foreach (var id in new uint[] { 3, 6, 7, 9, 10, 11, 12, 15, 19, 21, 28, 53 })
-                        properties[id] = id == 3 ? next.Value : session.GetProperty(pair.Key, id);
-                    items.Add(new(pair.Key, entry, next, properties));
-                }
-                if (stagingRoot is not null || sources is not null)
-                {
-                    var byPath = items.ToDictionary(i => i.Destination);
-                    var inputs = sources ?? ArchiveSourceEnumerator.EnumerateDirectory(stagingRoot!, token, relay);
-                    foreach (var inputItem in inputs)
-                    {
-                        token.ThrowIfCancellationRequested();
-                        inputItem.ValidateSource();
-                        var next = inputItem.Path;
-                        var valid = WindowsOutputNamePolicy.ValidateEntry(next, next.Value);
-                        if (valid is not null) return new(true, valid);
-                        var directory = inputItem.IsDirectory; var size = inputItem.Size;
-                        var modified = inputItem.Modified;
-                        var index = uint.MaxValue;
-                        if (byPath.TryGetValue(next, out var old))
-                        {
-                            if (directory != old.Entry.IsDirectory) return Fail(ArchiveFailureCode.ConflictDetected, "文件与目录路径冲突：" + next.Value);
-                            if (directory || !addOptions!.Overwrite || addOptions.WriteMode == ArchiveUpdateMode.Update && old.Entry.Modified is { } previous && modified <= previous) continue;
-                            index = old.Index;
-                        }
-                        var entry = new ArchiveEntryInfo(next, directory, size, 0, modified, directory ? ArchiveItemAttributes.Directory : ArchiveItemAttributes.None, !directory && callback.Encrypted, null, null);
-                        var properties = new Dictionary<uint, object?> { [3] = next.Value, [6] = directory, [7] = (ulong)size,
-                            [9] = (uint)inputItem.Attributes, [12] = modified };
-                        byPath[next] = new(index, entry, next, properties, inputItem.SourcePath, inputItem);
-                    }
-                    items = byPath.Values.ToList();
-                    callback.AddedFiles = items.Count(i => i.FilePath is not null && !i.Entry.IsDirectory);
-                    callback.AddedBytes = items.Where(i => i.FilePath is not null && !i.Entry.IsDirectory).Sum(i => i.Entry.UncompressedSize);
-                }
-                var filePaths = items.Where(i => !i.Entry.IsDirectory).Select(i => i.Destination).ToHashSet();
+                var failure = BuildItemPlan(session, snapshot, request, callback, token, relay,
+                    out var items, out var deletedIds, out var movedIds);
+                if (failure is not null) return new(true, failure);
+                bool deletedItem(ArchiveEntryInfo entry) => deletedIds.Contains(entry.Id);
+                bool movedItem(ArchiveEntryInfo entry) => movedIds.Contains(entry.Id);
+                var filePaths = items.Where(i => !i.Entry.IsDirectory).Select(i => ArchivePath.From(i.Destination.Value)).ToHashSet();
                 foreach (var item in items)
                     for (var parent = item.Destination.Parent; !parent.IsRoot; parent = parent.Parent)
                         if (filePaths.Contains(parent)) return Fail(ArchiveFailureCode.ConflictDetected, "文件与目录路径冲突：" + parent.Value);
-                // A destination directory itself may be virtual (no physical entry).
-                if (source is not null && !source.Equals(destination)
-                    && snapshot.Entries.Any(e => e.Path.Equals(destination) && !(source.Equals(e.Path) || source.IsAncestorOf(e.Path))))
-                    return Fail(ArchiveFailureCode.ConflictDetected, "目标路径已存在：" + destination!.Value);
                 callback.Items = items.ToArray();
                 callback.OriginalPaths = snapshot.PhysicalEntries.ToDictionary(pair => pair.Key, pair => pair.Value.Path.Value);
-                callback.AffectedFiles = callback.AddedFiles + snapshot.Entries.Count(e => !e.IsDirectory && (IsDeleted(e.Path)
-                    || source is not null && (source.Equals(e.Path) || source.IsAncestorOf(e.Path))
-                    || moves is not null && moves.Any(m => ArchivePath.From(m.Source.Value).IsAncestorOf(e.Path))));
+                callback.AffectedFiles = callback.AddedFiles + snapshot.Entries.Count(entry =>
+                    !entry.IsDirectory && (deletedItem(entry) || movedItem(entry)));
                 using (var file = new FileStream(output, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None))
                 {
                     plan.Owned = true;
                     callback.BeginWriting();
                     // Notify deleted names while constructing
                     // the update plan; these are not completed-file increments.
-                    foreach (var entry in snapshot.PhysicalEntries.Values.Where(entry => IsDeleted(entry.Path)))
+                    foreach (var entry in snapshot.PhysicalEntries.Values.Where(deletedItem))
                         callback.BeginItem(entry.Path.Value);
                     var hr = session.UpdateItems(new NativeOutputStream(file, token, callback.Written, context.Control), (uint)items.Count, callback);
                     token.ThrowIfCancellationRequested();

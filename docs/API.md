@@ -5,6 +5,31 @@ The consumer entry points are `SevenZipNativeLibrary` (loading/catalogs),
 `ArchiveHasher`. Requests/results, paths, passwords, progress and output plans
 are library-owned managed types. No host application, UI, CLI or COM object is returned.
 
+## Entry identity and versions
+
+`ArchiveEntryId` identifies one item in one `ArchiveRevision`. `ArchivePath` contains
+only a name: equal paths can belong to different physical entries. Inspection
+preserves those records, exposes `ById`, and returns a versioned snapshot.
+
+Build selections with `snapshot.Select(ids)` or `snapshot.SelectAll()`; selecting a
+directory expands its directory records and descendants. Pass the resulting
+`ArchiveEntrySelection` to `ExtractItemsAsync` / `ComputeItemsAsync`. Updates use
+`ArchiveItemUpdateRequest`: `Deleted` is an ID selection and each `ArchiveItemMove`
+contains a source ID plus a new destination path. The previous path-selector update
+and hash APIs have been removed.
+
+Reinspect after an update or source-file replacement. Operations reject IDs from a
+different revision with `ConflictDetected`; do not retain an ordinal as a persistent
+identity. Revisions include source-volume file identities, size and timestamps.
+New source paths and output names never identify an existing archive entry.
+
+Explicitly deleting IDs and supplying replacement content at their destination can
+replace one duplicate while retaining its same-named siblings, or replace an
+explicit group. A name-only addition cannot choose among multiple existing files.
+For extraction, map each source ID to a resolved output name in
+`IArchiveExtractionOutputPlan`; same-named entries need a replace/skip/keep-both
+policy on a case-insensitive output filesystem.
+
 ## Native boundary
 
 Native read sessions, archive RCWs, imported archive interfaces, module export

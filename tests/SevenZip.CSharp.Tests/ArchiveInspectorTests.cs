@@ -50,11 +50,16 @@ public sealed class ArchiveInspectorTests : IDisposable
     }
 
     [Fact]
-    public async Task RejectsCaseInsensitiveDuplicatePhysicalPaths()
+    public async Task PreservesCaseInsensitiveDuplicatePhysicalPathsAsSeparateWritableItems()
     {
         var path = CreateZip("data.txt", "DATA.txt");
-        var failure = await Assert.ThrowsAsync<ArchiveReadException>(() => ArchiveInspector.InspectAsync(Library, path));
-        Assert.Equal(ArchiveReadError.UnsupportedOperation, failure.Error);
+        var snapshot = await ArchiveInspector.InspectAsync(Library, path);
+        Assert.NotNull(snapshot);
+        Assert.True(snapshot.CanUpdate);
+        Assert.Equal(2, snapshot.Entries.Count);
+        Assert.Equal(2, snapshot.Entries.Select(entry => entry.Id).Distinct().Count());
+        Assert.Equal(0u, snapshot.PhysicalEntries[0].Id.Value);
+        Assert.Equal(1u, snapshot.PhysicalEntries[1].Id.Value);
         using var unlocked = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
     }
 

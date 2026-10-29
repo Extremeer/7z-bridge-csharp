@@ -47,10 +47,10 @@ var snapshot = await ArchiveInspector.InspectAsync(dllPath, archivePath, context
 // ArchiveReadException distinguishes damage, unsupported metadata and password errors.
 ```
 
-Inspection returns immutable managed entry/physical-index snapshots, offsets,
-source volumes and update support. No RCW escapes that operation. It rejects
-parent traversal and duplicate canonical physical paths, and releases its native
-source handles before returning. A host can supply an immutable copied
+Inspection returns immutable managed entries with independent versioned IDs,
+physical records, offsets, source volumes and update support. No RCW escapes that
+operation. Parent traversal is rejected; duplicate paths remain separate entries.
+Native source handles are released before returning. A host can supply an immutable copied
 `allowedFormats` policy in the context; null uses the DLL catalog, not a host's
 format list. Reported update support preserves the currently implemented ZIP/7Z update
 boundary, not every SDK handler's theoretical ability to write.
@@ -63,7 +63,8 @@ var extracted = await ArchiveExtractor.ExtractAsync(dllPath, archivePath, output
     extractionProgress: new ActionProgress<EngineExtractionProgress>(value =>
         Console.WriteLine($"Written bytes: {value.ProcessedBytes}")));
 var tested = await ArchiveExtractor.TestAsync(dllPath, archivePath, context);
-var hashed = await ArchiveHasher.ComputeAsync(dllPath, archivePath, [ArchivePath.Root], "SHA256", context);
+var selected = snapshot!.SelectAll(); // Or snapshot.Select(the IDs selected by your UI).
+var hashed = await ArchiveHasher.ComputeItemsAsync(dllPath, archivePath, selected, "SHA256", context);
 ```
 
 `EngineProgress` reports SDK work/ratio counters and phase statistics. They are
@@ -102,13 +103,18 @@ var created = await ArchiveWriter.CreateAsync(dllPath, inputDirectory,
         Compression = new() { Level = 5 }
     }, context);
 
-var updated = await ArchiveUpdater.UpdateAsync(dllPath, outputArchive,
-    new ArchiveUpdateRequest
+var current = (await ArchiveInspector.InspectAsync(dllPath, outputArchive, context))!;
+// Name queries must resolve to an explicit selection; Single refuses ambiguous matches.
+var obsolete = current.Entries.Single(entry => entry.Path.Value == "obsolete.txt");
+var moved = current.Entries.Single(entry => entry.Path.Value == "old.txt");
+var updated = await ArchiveUpdater.UpdateItemsAsync(dllPath, outputArchive,
+    new ArchiveItemUpdateRequest
     {
-        Deleted = [ArchivePath.From("obsolete.txt")],
-        Moves = [new(ArchivePath.From("old.txt"), ArchivePath.From("renamed.txt"))],
+        Deleted = current.Select([obsolete.Id]),
+        Moves = [new(moved.Id, ArchivePath.From("renamed.txt"))],
         Sources = [ArchiveSourceItem.FromFileSystem(inputFile, ArchivePath.From("new.txt"))]
     }, context);
+// Reinspect after success: IDs from current are now stale.
 ```
 
 Source lists separate physical files from archive paths and validate source size,

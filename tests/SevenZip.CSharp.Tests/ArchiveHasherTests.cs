@@ -24,7 +24,7 @@ public sealed class ArchiveHasherTests : IDisposable
     public async Task ComputesKnownDecodedVectorsWithoutTemporaryExtraction(string algorithm, string expected)
     {
         var path = CreateZip();
-        var outcome = await ArchiveHasher.ComputeAsync(Library, path, [ArchivePath.Root], algorithm);
+        var outcome = await NamedEntryFixture.HashAsync(Library, path, [ArchivePath.Root], algorithm);
         Assert.True(outcome.IsSuccess, outcome.Outcome.Error?.Message);
         var entry = Assert.Single(outcome.Entries!);
         Assert.Equal("data.txt", entry.Entry.Value);
@@ -37,17 +37,18 @@ public sealed class ArchiveHasherTests : IDisposable
     [Fact]
     public async Task UnsupportedHasherIsDistinguishedFromDecodeFailure()
     {
-        var outcome = await ArchiveHasher.ComputeAsync(Library, CreateZip(), [ArchivePath.Root], "not-a-hasher");
+        var outcome = await NamedEntryFixture.HashAsync(Library, CreateZip(), [ArchivePath.Root], "not-a-hasher");
         Assert.Equal(ArchiveFailureCode.UnsupportedOperation, outcome.Outcome.Error!.Code);
         Assert.False(outcome.DecodingAttempted);
     }
 
     [Fact]
-    public async Task MissingRequestedEntryIsNotASuccessfulEmptyHashResult()
+    public async Task StaleRequestedIdIsNotASuccessfulEmptyHashResult()
     {
         var path = CreateZip();
-        var outcome = await ArchiveHasher.ComputeAsync(Library, path, [ArchivePath.From("missing")], "SHA256");
-        Assert.Equal(ArchiveFailureCode.EntryNotFound, outcome.Outcome.Error!.Code);
+        var snapshot = (await ArchiveInspector.InspectAsync(Library, path))!;
+        var outcome = await ArchiveHasher.ComputeItemsAsync(Library, path, new(snapshot.Revision, [new(snapshot.Revision, uint.MaxValue)]), "SHA256");
+        Assert.Equal(ArchiveFailureCode.ConflictDetected, outcome.Outcome.Error!.Code);
         Assert.Null(outcome.Entries);
         Assert.True(outcome.DecodingAttempted);
         using var unlocked = File.Open(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);

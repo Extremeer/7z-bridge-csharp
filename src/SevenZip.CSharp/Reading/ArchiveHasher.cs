@@ -3,7 +3,10 @@ using static SevenZip.CSharp.NativeArchiveInterop;
 
 namespace SevenZip.CSharp;
 
-public sealed record ArchiveHashEntry(ArchivePath Entry, string Algorithm, string Hash);
+public sealed record ArchiveHashEntry(ArchivePath Entry, string Algorithm, string Hash)
+{
+    public ArchiveEntryId Id { get; init; }
+}
 public sealed record ArchiveHashOutcome(ArchiveEngineOutcome Outcome, IReadOnlyList<ArchiveHashEntry>? Entries = null,
     bool DecodingAttempted = false)
 {
@@ -14,19 +17,29 @@ public sealed record ArchiveHashOutcome(ArchiveEngineOutcome Outcome, IReadOnlyL
 [System.Runtime.Versioning.SupportedOSPlatform("windows")]
 public static class ArchiveHasher
 {
-    public static Task<ArchiveHashOutcome> ComputeAsync(string libraryPath, string path, IReadOnlyCollection<ArchivePath> entries,
+    public static Task<ArchiveHashOutcome> ComputeItemsAsync(string libraryPath, string path, ArchiveEntrySelection selection,
         string algorithm, ArchiveOperationContext? context = null, IProgress<EngineProgress>? progress = null)
     {
+        ArgumentNullException.ThrowIfNull(selection);
         context ??= new();
-        return ComputeWithPasswordsAsync(libraryPath, path, entries, algorithm, context.Password, context.Password,
+        return ComputeItemsWithPasswordsAsync(libraryPath, path, selection, algorithm, context.Password, context.Password,
             context.CancellationToken, progress, context);
     }
 
-    public static async Task<ArchiveHashOutcome> ComputeWithPasswordsAsync(string libraryPath, string path,
-        IReadOnlyCollection<ArchivePath> entries, string algorithm, ArchivePassword? headerPassword, ArchivePassword? dataPassword,
+    public static Task<ArchiveHashOutcome> ComputeItemsWithPasswordsAsync(string libraryPath, string path,
+        ArchiveEntrySelection selection, string algorithm, ArchivePassword? headerPassword, ArchivePassword? dataPassword,
         CancellationToken token, IProgress<EngineProgress>? progress = null, ArchiveOperationContext? context = null)
     {
-        ArgumentNullException.ThrowIfNull(entries);
+        ArgumentNullException.ThrowIfNull(selection);
+        return ComputeCoreAsync(libraryPath, path, selection, algorithm, headerPassword, dataPassword, token,
+            progress, context);
+    }
+
+    private static async Task<ArchiveHashOutcome> ComputeCoreAsync(string libraryPath, string path,
+        ArchiveEntrySelection selection, string algorithm, ArchivePassword? headerPassword, ArchivePassword? dataPassword,
+        CancellationToken token, IProgress<EngineProgress>? progress = null, ArchiveOperationContext? context = null)
+    {
+        ArgumentNullException.ThrowIfNull(selection);
         if (token.IsCancellationRequested) return new(new(true, new(ArchiveFailureCode.OperationCancelled, "操作已取消")));
         var library = SevenZipNativeLibrary.Load(libraryPath);
         using (var probe = SevenZipNativeHasher.Create(library, algorithm))
@@ -37,7 +50,7 @@ public static class ArchiveHasher
         try
         {
             HashOutput? current = null;
-            var outcome = await ArchiveExtractor.RunToStreamsWithPasswordsAsync(libraryPath, path, entries,
+            var outcome = await ArchiveExtractor.RunToStreamsWithPasswordsAsync(libraryPath, path, selection,
                 entry =>
                 {
                     lock (gate)
@@ -49,7 +62,7 @@ public static class ArchiveHasher
                 {
                     lock (gate)
                     {
-                        results.Add(new(entry.Path, algorithm, current!.Finish())); current.Dispose(); current = null;
+                        results.Add(new(entry.Path, algorithm, current!.Finish()) { Id = entry.Id }); current.Dispose(); current = null;
                     }
                 }, headerPassword, dataPassword, token, progress, context).ConfigureAwait(false);
             return new(outcome, outcome.IsSuccess

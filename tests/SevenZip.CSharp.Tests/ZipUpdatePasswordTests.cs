@@ -32,7 +32,7 @@ public sealed class ZipUpdatePasswordTests : IDisposable
         return path;
     }
 
-    private ArchiveUpdateRequest Request(string operation)
+    private NamedUpdatePlan Request(string operation)
     {
         var added = Path.Combine(root, "added.txt"); File.WriteAllText(added, "new data");
         return operation switch
@@ -56,7 +56,7 @@ public sealed class ZipUpdatePasswordTests : IDisposable
     public async Task MissingZipPasswordAllowsEncodedUpdatesAndLeavesNewDataUnencrypted(ArchiveEncryptionAlgorithm method, string operation)
     {
         var path = await Create(method);
-        var result = await ArchiveUpdater.UpdateAsync(Library, path, Request(operation));
+        var result = await NamedEntryFixture.ApplyAsync(Library, path, Request(operation));
         Assert.True(result.IsSuccess, result.Error?.Message);
         using var original = new ArchivePassword(Secret);
         var snapshot = await ArchiveInspector.InspectAsync(Library, path);
@@ -81,7 +81,7 @@ public sealed class ZipUpdatePasswordTests : IDisposable
         var path = await Create(method);
         using var password = new ArchivePassword(Secret); var context = new ArchiveOperationContext(password);
         var reports = new List<EngineProgress>();
-        var result = await ArchiveUpdater.UpdateAsync(Library, path, Request(operation), context, new ActionProgress<EngineProgress>(reports.Add));
+        var result = await NamedEntryFixture.ApplyAsync(Library, path, Request(operation), context, new ActionProgress<EngineProgress>(reports.Add));
         Assert.True(result.IsSuccess, result.Error?.Message);
         string[] expected = operation switch
         {
@@ -103,7 +103,7 @@ public sealed class ZipUpdatePasswordTests : IDisposable
         var path = await Create(method);
         using var wrong = new ArchivePassword("incorrect-password");
         var reports = new List<EngineProgress>();
-        var result = await ArchiveUpdater.UpdateAsync(Library, path, Request(operation), new(wrong),
+        var result = await NamedEntryFixture.ApplyAsync(Library, path, Request(operation), new(wrong),
             new ActionProgress<EngineProgress>(reports.Add));
         Assert.True(result.IsSuccess, result.Error?.Message);
         Assert.DoesNotContain(reports, value => value.MetricsScope == "update-password-validation");
@@ -131,7 +131,7 @@ public sealed class ZipUpdatePasswordTests : IDisposable
         var snapshot = await ArchiveInspector.InspectAsync(Library, path, new(password));
         var measured = new ExtractionMeasurement(snapshot!.Entries.Where(item => item.Path.Value == entry),
             new ActionProgress<EngineExtractionProgress>(_ => { }));
-        return await ArchiveExtractor.RunWithPasswordsAsync(Library, path, Path.Combine(root, directory), measured,
+        return await ArchiveExtractor.RunItemsWithPasswordsAsync(Library, path, snapshot.Select(measured.Entries.Select(item => item.Id)), Path.Combine(root, directory), measured,
             password, password, default);
     }
 

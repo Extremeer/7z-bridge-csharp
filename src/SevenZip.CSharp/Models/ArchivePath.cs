@@ -25,9 +25,7 @@ public sealed class ArchivePath : IEquatable<ArchivePath>, IComparable<ArchivePa
         _segments = segments;
     }
 
-    /// <summary>
-    /// 根路径。
-    /// </summary>
+    /// <summary>Root archive path, with no entry identity attached.</summary>
     public static ArchivePath Root { get; } = new(ImmutableArray<string>.Empty);
 
     /// <summary>

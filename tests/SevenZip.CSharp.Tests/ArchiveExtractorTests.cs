@@ -96,7 +96,7 @@ public sealed class ArchiveExtractorTests : IDisposable
     public async Task ManagedSinkFailureKeepsItsCategoryAndDoesNotLeakSecrets()
     {
         var path = CreateZip();
-        var outcome = await ArchiveExtractor.RunToStreamsWithPasswordsAsync(Library, path, [ArchivePath.Root],
+        var outcome = await ArchiveExtractor.RunToStreamsWithPasswordsAsync(Library, path, (await ArchiveInspector.InspectAsync(Library, path))!.SelectAll(),
             _ => throw new IOException("secret", unchecked((int)0x80070070)), _ => { }, null, null, default);
         Assert.Equal(ArchiveFailureCode.InsufficientDiskSpace, outcome.Error!.Code);
         Assert.DoesNotContain("secret", outcome.Error.Message);

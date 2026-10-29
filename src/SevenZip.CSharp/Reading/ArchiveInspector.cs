@@ -11,7 +11,26 @@ namespace SevenZip.CSharp;
 [System.Runtime.Versioning.SupportedOSPlatform("windows")]
 public static class ArchiveInspector
 {
-    public sealed record Snapshot(string Format, IReadOnlyList<ArchiveEntryInfo> Entries, IReadOnlyDictionary<uint, ArchiveEntryInfo> PhysicalEntries, bool IsMultiVolume = false, long ArchiveOffset = 0, long PrefixLength = 0, bool CanUpdate = false, bool RequiresHeaderPassword = false, IReadOnlyList<string>? SourceFiles = null);
+    public sealed record Snapshot(string Format, IReadOnlyList<ArchiveEntryInfo> Entries, IReadOnlyDictionary<uint, ArchiveEntryInfo> PhysicalEntries, bool IsMultiVolume = false, long ArchiveOffset = 0, long PrefixLength = 0, bool CanUpdate = false, bool RequiresHeaderPassword = false, IReadOnlyList<string>? SourceFiles = null)
+    {
+        public ArchiveRevision Revision { get; init; }
+        public IReadOnlyDictionary<ArchiveEntryId, ArchiveEntryInfo> ById { get; init; } =
+            new Dictionary<ArchiveEntryId, ArchiveEntryInfo>();
+
+        public ArchiveEntrySelection SelectAll() => new(Revision, Entries.Select(entry => entry.Id), isAll: true);
+        public ArchiveEntrySelection Select(IEnumerable<ArchiveEntryId> ids, bool includeDescendants = true)
+        {
+            ArgumentNullException.ThrowIfNull(ids);
+            var selected = ids.Distinct().Select(id => ById.TryGetValue(id, out var entry) ? entry
+                : throw new ArgumentException("条目选择已失效，请刷新归档", nameof(ids))).ToArray();
+            var directories = includeDescendants ? selected.Where(entry => entry.IsDirectory).ToArray() : [];
+            return new(Revision, selected.Select(entry => entry.Id).Concat(Entries.Where(entry =>
+                directories.Any(directory => directory.Path.IsAncestorOf(entry.Path)
+                    && (entry.IsDirectory || entry.Path.Segments.Count > directory.Path.Segments.Count))).Select(entry => entry.Id)));
+        }
+        public bool IsCurrent(ArchiveEntrySelection selection) => selection.Revision == Revision
+            && selection.Ids.All(ById.ContainsKey) && (!selection.IsAll || selection.Count == ById.Count);
+    }
 
     public static Task<Snapshot?> InspectAsync(string libraryPath, string path, ArchiveOperationContext? context = null)
     {
@@ -50,12 +69,12 @@ public static class ArchiveInspector
             throw new ArchiveReadException(ArchiveReadError.ArchiveDamaged, "压缩包包含结构错误或校验警告，不能作为正常归档接受");
         }
         if ((ArchiveNumber(35) != 0 || ArchiveNumber(39) > 1) && !session.IsMultiVolume) return null;
+        var revision = ArchiveRevision.Capture(session.SourceFiles, format);
         var count = session.ItemCount;
         var singleStream = format is "gzip" or "bzip2" or "xz" or "zstd";
         if (singleStream && count != 1) return null;
-        var entries = new Dictionary<ArchivePath, ArchiveEntryInfo>();
+        var parents = new Dictionary<ArchivePath, ArchiveEntryInfo>();
         var physical = new Dictionary<uint, ArchiveEntryInfo>();
-        var physicalPaths = new HashSet<ArchivePath>();
         for (uint index = 0; index < count; index++)
         {
             token.ThrowIfCancellationRequested();
@@ -75,8 +94,6 @@ public static class ArchiveInspector
             if (string.IsNullOrWhiteSpace(rawPath)) return null;
             var entryPath = ArchivePath.From(rawPath.Replace('\\', '/'));
             if (entryPath.IsRoot) return null;
-            if (!physicalPaths.Add(entryPath))
-                throw new ArchiveReadException(ArchiveReadError.UnsupportedOperation, "压缩包包含重复条目路径，无法安全读取或修改");
             var directory = Property(index, 6) is true;
             var flags = ArchiveItemAttributes.None;
             if (anti) flags |= ArchiveItemAttributes.AntiItem;
@@ -102,28 +119,39 @@ public static class ArchiveInspector
                 method = session.GetArchiveProperty(22) as string;
             }
             var rawSize = Property(index, 7);
-            entries[entryPath] = new ArchiveEntryInfo(entryPath, directory,
+            var entry = new ArchiveEntryInfo(entryPath, directory,
                 checked((long)Number(rawSize)), checked((long)packed),
                 synthetic && format != "gzip" ? null : Property(index, 12) as DateTimeOffset?, flags, encrypted, method,
-                Property(index, 28) as string, Property(index, 19) as uint?, directory || rawSize is uint or ulong);
-            physical.Add(index, entries[entryPath]);
+                Property(index, 28) as string, Property(index, 19) as uint?, directory || rawSize is uint or ulong, new ArchiveEntryId(revision, index));
+            physical.Add(index, entry);
             var parent = entryPath.Parent;
             while (!parent.IsRoot)
             {
-                entries.TryAdd(parent, new ArchiveEntryInfo(parent, true, 0, 0, null,
+                parents.TryAdd(parent, new ArchiveEntryInfo(parent, true, 0, 0, null,
                     ArchiveItemAttributes.Directory, false, null));
                 parent = parent.Parent;
             }
         }
+        // Files are archive items, not Windows destinations. Preserve every index.
+        // Directories retain the merged navigation tree, as in the 7-Zip file manager.
+        var nextVirtualId = count;
+        var physicalDirectories = physical.Values.Where(entry => entry.IsDirectory).Select(entry => entry.Path).ToHashSet();
+        var virtualDirectories = parents.Values.Where(entry => entry.IsDirectory && !physicalDirectories.Contains(entry.Path))
+            .Select(entry => entry.WithId(new ArchiveEntryId(revision, nextVirtualId++))).ToArray();
+        var listing = physical.Values.Concat(virtualDirectories).ToArray();
         var offset = checked((long)ArchiveNumber(36));
         var prefix = checked((long)(ArchiveNumber(36) + ArchiveNumber(88)));
         var canUpdate = session.CanUpdate && format is "zip" or "7z"
             && (format != "zip" || offset == prefix)
-            && !entries.Values.Any(e => (e.Attributes & (ArchiveItemAttributes.SymbolicLink | ArchiveItemAttributes.HardLink
+            && !physical.Values.Any(e => (e.Attributes & (ArchiveItemAttributes.SymbolicLink | ArchiveItemAttributes.HardLink
                 | ArchiveItemAttributes.AntiItem | ArchiveItemAttributes.AlternateDataStream | ArchiveItemAttributes.ReparsePoint)) != 0);
-        return new Snapshot(format, Array.AsReadOnly(entries.Values.OrderBy(e => e.Path.Value,
+        return new Snapshot(format, Array.AsReadOnly(listing.OrderBy(e => e.Path.Value,
             StringComparer.OrdinalIgnoreCase).ToArray()), new System.Collections.ObjectModel.ReadOnlyDictionary<uint, ArchiveEntryInfo>(physical), session.IsMultiVolume,
-            offset, prefix, canUpdate, session.HeaderPasswordRequested, session.SourceFiles);
+            offset, prefix, canUpdate, session.HeaderPasswordRequested, session.SourceFiles)
+        {
+            Revision = revision,
+            ById = new System.Collections.ObjectModel.ReadOnlyDictionary<ArchiveEntryId, ArchiveEntryInfo>(listing.ToDictionary(entry => entry.Id))
+        };
 
         ulong ArchiveNumber(uint id) => Number(session.GetArchiveProperty(id));
         object? Property(uint index, uint id) => session.GetProperty(index, id);

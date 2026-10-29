@@ -18,9 +18,11 @@ public sealed class ArchiveEntryInfo : IEquatable<ArchiveEntryInfo>
         string? compressionMethod,
         string? comment = null,
         uint? crc32 = null,
-        bool hasKnownUncompressedSize = true)
+        bool hasKnownUncompressedSize = true,
+        ArchiveEntryId? id = null)
     {
         Path = path ?? throw new ArgumentNullException(nameof(path));
+        Id = id ?? ArchiveEntryId.Detached();
         IsDirectory = isDirectory;
 
         if (uncompressedSize < 0)
@@ -49,6 +51,10 @@ public sealed class ArchiveEntryInfo : IEquatable<ArchiveEntryInfo>
         HasKnownUncompressedSize = hasKnownUncompressedSize;
     }
 
+    public ArchiveEntryId Id { get; }
+    public ArchiveEntryInfo WithId(ArchiveEntryId id) => new(Path, IsDirectory, UncompressedSize, CompressedSize, Modified,
+        Attributes, IsEncrypted, CompressionMethod, Comment, Crc32, HasKnownUncompressedSize, id);
+
     public ArchivePath Path { get; }
 
     public bool IsDirectory { get; }
@@ -73,11 +79,11 @@ public sealed class ArchiveEntryInfo : IEquatable<ArchiveEntryInfo>
 
     public string Name => Path.Name;
 
-    public ArchiveEntryInfo WithPath(ArchivePath newPath) => new(newPath, IsDirectory, UncompressedSize, CompressedSize, Modified, Attributes, IsEncrypted, CompressionMethod, Comment, Crc32, HasKnownUncompressedSize);
+    public ArchiveEntryInfo WithPath(ArchivePath newPath) => new(newPath, IsDirectory, UncompressedSize, CompressedSize, Modified, Attributes, IsEncrypted, CompressionMethod, Comment, Crc32, HasKnownUncompressedSize, Id);
 
-    public ArchiveEntryInfo WithSizes(long uncompressedSize, long compressedSize) => new(Path, IsDirectory, uncompressedSize, compressedSize, Modified, Attributes, IsEncrypted, CompressionMethod, Comment, Crc32);
+    public ArchiveEntryInfo WithSizes(long uncompressedSize, long compressedSize) => new(Path, IsDirectory, uncompressedSize, compressedSize, Modified, Attributes, IsEncrypted, CompressionMethod, Comment, Crc32, true, Id);
 
-    public ArchiveEntryInfo WithAttributes(ArchiveItemAttributes attributes) => new(Path, IsDirectory, UncompressedSize, CompressedSize, Modified, attributes, IsEncrypted, CompressionMethod, Comment, Crc32, HasKnownUncompressedSize);
+    public ArchiveEntryInfo WithAttributes(ArchiveItemAttributes attributes) => new(Path, IsDirectory, UncompressedSize, CompressedSize, Modified, attributes, IsEncrypted, CompressionMethod, Comment, Crc32, HasKnownUncompressedSize, Id);
 
     public bool Equals(ArchiveEntryInfo? other)
     {
